@@ -1,472 +1,616 @@
 """
-ExoHabitAI — Flask Backend API  (v2.1)
-App.py: Main Flask application
+================================================================================
+ExoHabitAI — Flask Backend API                                    app.py
+================================================================================
+Internship Project: AI/ML Approach for Predicting Habitability of Exoplanets
+Module 5  — Backend API Integration
 
-Endpoints:
-  POST /train-model   — Accept CSV/JSON dataset, train model, save artifacts
-  POST /predict       — Single-planet habitability prediction
-  POST /predict-batch — Batch prediction from CSV/JSON
-  GET  /health        — Health check
-
-Field alias support
--------------------
-The frontend uses NASA Exoplanet Archive column names.
-This backend accepts BOTH sets of names and maps them internally:
-
-  Frontend name   →  Canonical name
-  pl_orbper       →  orbital_period
-  pl_orbsmax      →  semi_major_axis
-  pl_rade         →  planet_radius
-  pl_bmasse       →  planet_mass
-  pl_eqt          →  surface_temp
-  st_teff         →  star_temperature
-  st_met          →  star_metallicity
-  st_lum          →  luminosity
-  st_rad          →  star_radius
-  st_spectype     →  spectral_type
+Endpoints
+---------
+  GET  /               — API index & endpoint listing
+  GET  /health         — Health check and model status
+  POST /predict        — Predict habitability for a single exoplanet
+  POST /predict-batch  — Predict habitability for multiple exoplanets (JSON/CSV)
+  GET  /rank           — Return top-N pre-ranked exoplanets from ranked CSV
+  POST /rank           — Score and rank a submitted list of exoplanets
+================================================================================
 """
 
 import io
-import os
-import joblib
-import numpy as np
-import pandas as pd
+import json
 
-from flask import Flask, request, jsonify
+import pandas as pd
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.metrics import accuracy_score
+from utils import (
+    format_prediction,
+    load_artifacts,
+    load_ranked_data,
+    planet_identity,
+    score_payload,
+    validate_input,
+)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# App initialisation
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Column name mapping for /train-and-predict (RawDataPanel) ────────────────
+# Maps human-readable & alternative names → NASA API field names
+RAW_COLUMN_MAP = {
+    "planet_radius":      "pl_rade",
+    "planet_mass":        "pl_bmasse",
+    "orbital_period":     "pl_orbper",
+    "semi_major_axis":    "pl_orbsmax",
+    "surface_temp":       "pl_eqt",
+    "equilibrium_temp":   "pl_eqt",
+    "equilibrium_temperature": "pl_eqt",
+    "star_temperature":   "st_teff",
+    "host_star_temperature": "st_teff",
+    "star_metallicity":   "st_met",
+    "stellar_metallicity": "st_met",
+    "luminosity":         "st_lum",
+    "star_luminosity":    "st_lum",
+    "spectral_type":      "st_spectype",
+    "star_type":          "st_spectype",
+    # NASA pass-throughs
+    "pl_rade":            "pl_rade",
+    "pl_bmasse":          "pl_bmasse",
+    "pl_orbper":          "pl_orbper",
+    "pl_orbsmax":         "pl_orbsmax",
+    "pl_eqt":             "pl_eqt",
+    "st_teff":            "st_teff",
+    "st_met":             "st_met",
+    "st_lum":             "st_lum",
+    "st_spectype":        "st_spectype",
+    "pl_name":            "pl_name",
+    "hostname":           "hostname",
+}
+
+# ── App initialisation ────────────────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app, origins=[
-    "http://localhost:3000", "http://127.0.0.1:3000",
-    "http://localhost:3001", "http://127.0.0.1:3001",
-    "http://localhost:5173", "http://127.0.0.1:5173",
-])
+CORS(
+    app,
+    origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Constants & field aliases
-# ──────────────────────────────────────────────────────────────────────────────
-BASE_DIR = os.path.dirname(__file__)
-
-MODEL_PATH   = os.path.join(BASE_DIR, "trained_model.pkl")
-SCALER_PATH  = os.path.join(BASE_DIR, "scaler.pkl")
-ENCODER_PATH = os.path.join(BASE_DIR, "encoder.pkl")
-
-# Maps OLD frontend/NASA names → canonical internal names
-FIELD_ALIASES = {
-    # planetary
-    "pl_orbper"  : "orbital_period",
-    "pl_orbsmax" : "semi_major_axis",
-    "pl_rade"    : "planet_radius",
-    "pl_bmasse"  : "planet_mass",
-    "pl_eqt"     : "surface_temp",
-    # stellar
-    "st_teff"    : "star_temperature",
-    "st_met"     : "star_metallicity",
-    "st_lum"     : "luminosity",
-    "st_rad"     : "star_radius",
-    "st_spectype": "spectral_type",
-    # label alias
-    "habitable"  : "habitability_label",
-    "label"      : "habitability_label",
-}
-
-# Canonical feature order used during training — never change this order
-NUMERIC_FEATURES = [
-    "planet_radius",
-    "planet_mass",
-    "orbital_period",
-    "semi_major_axis",
-    "surface_temp",
-    "star_temperature",
-    "star_metallicity",
-    "luminosity",
-    "star_radius",
-]
-CATEGORICAL_FEATURE  = "spectral_type"
-TARGET_COL           = "habitability_label"
-
-ALL_REQUIRED_COLUMNS = NUMERIC_FEATURES + [CATEGORICAL_FEATURE, TARGET_COL]
-ALL_FEATURE_COLUMNS  = NUMERIC_FEATURES + [CATEGORICAL_FEATURE]
-
-# Default values used when optional fields are missing in frontend calls
-FEATURE_DEFAULTS = {
-    "planet_radius"   : 1.0,
-    "planet_mass"     : 1.0,
-    "orbital_period"  : 365.0,
-    "semi_major_axis" : 1.0,
-    "surface_temp"    : 288.0,
-    "star_temperature": 5778.0,
-    "star_metallicity": 0.0,
-    "luminosity"      : 1.0,
-    "star_radius"     : 1.0,
-    "spectral_type"   : "G",
-}
-
-THRESHOLD = 0.5
+# Load ML artifacts once at startup
+MODEL_LOADED = load_artifacts()
+if MODEL_LOADED:
+    print("[INFO] ML model and preprocessing artifacts loaded successfully.")
+else:
+    print("[WARNING] Model artifacts NOT loaded. /predict and POST /rank return 503.")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Load persisted artifacts at startup
-# ──────────────────────────────────────────────────────────────────────────────
-def _load_artifacts():
-    m = s = e = None
-    try:
-        m = joblib.load(MODEL_PATH)
-        s = joblib.load(SCALER_PATH)
-        e = joblib.load(ENCODER_PATH)
-        print("[OK] All ML artifacts loaded successfully.")
-    except FileNotFoundError:
-        print("[INFO] Artifacts not found — call POST /train-model first.")
-    return m, s, e
+# ── Internal helpers ──────────────────────────────────────────────────────────
 
-model, scaler, encoder = _load_artifacts()
+def error_response(message: str, status_code: int, details=None):
+    """Return a structured JSON error response."""
+    payload = {"status": "error", "message": message, "error": message}
+    if details is not None:
+        payload["details"] = details
+    return jsonify(payload), status_code
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helper: apply field aliases to a dict or DataFrame
-# ──────────────────────────────────────────────────────────────────────────────
-def _apply_aliases_dict(d: dict) -> dict:
-    """Rename keys in a dict using FIELD_ALIASES (old name → canonical name)."""
-    out = {}
-    for k, v in d.items():
-        canonical = FIELD_ALIASES.get(k, k)   # use alias if known, else keep as-is
-        out[canonical] = v
-    return out
+def score_item(item: dict, index: int | None = None) -> dict:
+    """Validate, score, and annotate a single exoplanet dict."""
+    errors, normalized = validate_input(item)
+    if errors:
+        payload = {"errors": errors}
+        if index is not None:
+            payload["row_index"] = index
+        return payload
+
+    probability = score_payload(normalized)
+    result = format_prediction(probability)
+    result.update(planet_identity(normalized, f"Planet_{(index or 0) + 1}"))
+    if index is not None:
+        result["row_index"] = index
+    return result
 
 
-def _apply_aliases_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename columns in a DataFrame using FIELD_ALIASES."""
-    df = df.copy()
-    df.columns = [c.strip().lower().replace(" ", "_").replace("-", "_") for c in df.columns]
-    df = df.rename(columns=FIELD_ALIASES)
-    return df
+def parse_batch_payload():
+    """
+    Parse a batch request from:
+      • Uploaded CSV / JSON file  (multipart form, field name = 'file')
+      • JSON body — array of objects
+      • JSON body — object with 'items' key containing an array
+    Returns (items_list, error_str).
+    """
+    if request.files:
+        file = request.files.get("file")
+        if file is None or not file.filename:
+            return None, "No file uploaded."
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helper: fill missing features with defaults
-# ──────────────────────────────────────────────────────────────────────────────
-def _fill_defaults(d: dict) -> dict:
-    """Fill any missing canonical feature fields with sensible defaults."""
-    out = dict(d)
-    for feat, default in FEATURE_DEFAULTS.items():
-        if feat not in out or out[feat] is None or str(out[feat]).strip() == "":
-            out[feat] = default
-    return out
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helper: preprocess a canonical feature DataFrame → scaled numpy array
-# ──────────────────────────────────────────────────────────────────────────────
-def _preprocess(df: pd.DataFrame, sc: StandardScaler, le: LabelEncoder) -> np.ndarray:
-    df = df.copy()
-    known = list(le.classes_)
-    df[CATEGORICAL_FEATURE] = (
-        df[CATEGORICAL_FEATURE]
-        .astype(str).str.strip()
-        .apply(lambda x: x if x in known else known[0])
-    )
-    df["spectral_type_encoded"] = le.transform(df[CATEGORICAL_FEATURE])
-    feature_order = NUMERIC_FEATURES + ["spectral_type_encoded"]
-    X = df[feature_order].astype(float).values
-    return sc.transform(X)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helper: parse request body → normalised DataFrame
-# ──────────────────────────────────────────────────────────────────────────────
-def _parse_body(req) -> pd.DataFrame:
-    ct = req.content_type or ""
-    if "application/json" in ct:
-        data = req.get_json(force=True, silent=True)
-        if data is None:
-            raise ValueError("Invalid JSON body.")
-        if isinstance(data, dict):
-            data = [data]
-        df = pd.DataFrame(data)
-    elif "multipart/form-data" in ct:
-        if "file" not in req.files:
-            raise ValueError("Expected a file under the key 'file'.")
-        df = pd.read_csv(req.files["file"])
-    elif "text/csv" in ct:
-        df = pd.read_csv(io.StringIO(req.get_data(as_text=True)))
-    else:
-        # Try JSON first, then CSV
+        content = file.read().decode("utf-8-sig")
+        filename = file.filename.lower()
         try:
-            data = req.get_json(force=True, silent=False)
-            if isinstance(data, dict):
-                data = [data]
-            df = pd.DataFrame(data)
-        except Exception:
-            try:
-                df = pd.read_csv(io.StringIO(req.get_data(as_text=True)))
-            except Exception:
-                raise ValueError(
-                    "Cannot parse request body. "
-                    "Send JSON (application/json) or CSV (text/csv / multipart)."
-                )
-    return _apply_aliases_df(df)
+            if filename.endswith(".json"):
+                payload = json.loads(content)
+                if isinstance(payload, dict):
+                    payload = [payload]
+                if not isinstance(payload, list):
+                    return None, "JSON batch file must contain an array of objects."
+                return payload, None
+
+            if filename.endswith(".csv"):
+                frame = pd.read_csv(io.StringIO(content))
+                return frame.to_dict(orient="records"), None
+        except Exception as exc:
+            return None, f"Unable to parse uploaded file: {exc}"
+
+        return None, "Only CSV and JSON batch files are supported."
+
+    payload = request.get_json(silent=True)
+    if isinstance(payload, dict):
+        if "items" in payload and isinstance(payload["items"], list):
+            return payload["items"], None
+        return [payload], None
+    if isinstance(payload, list):
+        return payload, None
+    return None, "Expected a JSON array, JSON object, or an uploaded CSV/JSON file."
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ROUTE: Health check
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
+
 @app.route("/", methods=["GET"])
+def home():
+    """API index — lists all available endpoints."""
+    return jsonify(
+        {
+            "status": "success",
+            "message": "ExoHabitAI Backend API is running.",
+            "model_loaded": MODEL_LOADED,
+            "version": "1.0.0",
+            "endpoints": {
+                "GET  /":                   "This index page",
+                "GET  /health":             "Health check and model status",
+                "POST /predict":            "Predict habitability for a single exoplanet",
+                "POST /predict-batch":      "Batch prediction — JSON array or CSV file upload",
+                "GET  /rank":               "Top-N pre-ranked exoplanets (?top=N, default 10)",
+                "POST /rank":               "Score and rank a submitted list of exoplanets",
+                "POST /train-and-predict":  "Parse raw CSV/JSON dataset and predict every row",
+            },
+        }
+    )
+
+
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "status"      : "ok",
-        "api"         : "ExoHabitAI Backend",
-        "version"     : "2.1",
-        "model_loaded": model is not None,
-        "endpoints"   : {
-            "POST /train-model"  : "Upload CSV/JSON dataset to train the model",
-            "POST /predict"      : "Predict habitability for a single planet",
-            "POST /predict-batch": "Batch predict from CSV or JSON array",
-            "GET  /health"       : "Health check",
+    """Health-check endpoint — returns 200 when the model is ready."""
+    return jsonify(
+        {
+            "status": "success",
+            "model_loaded": MODEL_LOADED,
+            "message": (
+                "API is healthy and ready."
+                if MODEL_LOADED
+                else "API is up but model is not loaded."
+            ),
         }
-    }), 200
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# ROUTE: POST /train-model
-# ──────────────────────────────────────────────────────────────────────────────
-@app.route("/train-model", methods=["POST"])
-def train_model():
-    global model, scaler, encoder
-
-    try:
-        df = _parse_body(request)
-    except ValueError as e:
-        return jsonify({"status": "error", "message": str(e)}), 400
-
-    # Validate required columns (after alias mapping)
-    missing = [c for c in ALL_REQUIRED_COLUMNS if c not in df.columns]
-    if missing:
-        return jsonify({
-            "status" : "error",
-            "message": f"Missing required columns: {missing}",
-            "tip"    : "Accepted aliases: pl_orbper→orbital_period, st_teff→star_temperature, etc.",
-        }), 400
-
-    # Coerce types & drop NaN
-    df[NUMERIC_FEATURES]     = df[NUMERIC_FEATURES].apply(pd.to_numeric, errors="coerce")
-    df[CATEGORICAL_FEATURE]  = df[CATEGORICAL_FEATURE].astype(str).str.strip()
-    n_before = len(df)
-    df = df.dropna(subset=ALL_REQUIRED_COLUMNS)
-    n_dropped = n_before - len(df)
-
-    if len(df) < 10:
-        return jsonify({
-            "status" : "error",
-            "message": f"Only {len(df)} valid rows after cleaning — need at least 10."
-        }), 400
-
-    y = df[TARGET_COL].astype(int)
-    if not set(y.unique()).issubset({0, 1}):
-        return jsonify({
-            "status" : "error",
-            "message": f"habitability_label must be 0 or 1. Found: {sorted(y.unique().tolist())}"
-        }), 400
-
-    # Encode + scale
-    le = LabelEncoder()
-    df["spectral_type_encoded"] = le.fit_transform(df[CATEGORICAL_FEATURE])
-    feature_order = NUMERIC_FEATURES + ["spectral_type_encoded"]
-    X = df[feature_order].astype(float)
-    sc = StandardScaler()
-    X_scaled = sc.fit_transform(X)
-
-    # Train/test split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    # Train
-    clf = RandomForestClassifier(
-        n_estimators=200, max_depth=12, min_samples_leaf=4,
-        class_weight="balanced", random_state=42, n_jobs=-1,
-    )
-    clf.fit(X_train, y_train)
 
-    acc = accuracy_score(y_test, clf.predict(X_test))
-
-    # Save
-    joblib.dump(clf, MODEL_PATH)
-    joblib.dump(sc,  SCALER_PATH)
-    joblib.dump(le,  ENCODER_PATH)
-
-    model, scaler, encoder = clf, sc, le
-
-    return jsonify({
-        "status"          : "success",
-        "message"         : "Model trained and saved successfully.",
-        "samples_used"    : len(df),
-        "samples_dropped" : n_dropped,
-        "train_size"      : len(X_train),
-        "test_size"       : len(X_test),
-        "accuracy"        : round(float(acc), 4),
-        "accuracy_pct"    : f"{acc * 100:.2f}%",
-        "spectral_classes": list(le.classes_),
-        "artifacts_saved" : {
-            "model"  : MODEL_PATH,
-            "scaler" : SCALER_PATH,
-            "encoder": ENCODER_PATH,
-        }
-    }), 200
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# ROUTE: POST /predict
-# ──────────────────────────────────────────────────────────────────────────────
 @app.route("/predict", methods=["POST"])
 def predict():
-    if model is None:
-        return jsonify({
-            "status" : "error",
-            "message": "Model not loaded. Run POST /train-model first."
-        }), 503
+    """
+    Predict the habitability of a single exoplanet.
 
-    # Parse JSON
-    raw = request.get_json(force=True, silent=True)
-    if raw is None:
-        return jsonify({"status": "error", "message": "Invalid JSON body."}), 400
+    Request body (JSON):
+        {
+            "pl_orbper":   365.25,   # Orbital period (days)            [required]
+            "pl_orbsmax":  1.0,      # Semi-major axis (AU)             [required]
+            "st_teff":     5778,     # Star effective temperature (K)   [required]
+            "st_met":      0.0,      # Star metallicity [Fe/H]          [required]
+            "st_spectype": "G",      # Spectral type letter             [required]
+            "pl_rade":     1.0,      # Planet radius (Earth radii)      [optional]
+            "pl_bmasse":   1.0,      # Planet mass (Earth masses)       [optional]
+            "pl_eqt":      288.0,    # Equilibrium temperature (K)      [optional]
+            "pl_dens":     5.5,      # Planet density (g/cm³)           [optional]
+            "st_lum":      0.0,      # Stellar luminosity log10(L/L☉)   [optional]
+            "pl_name":     "Earth",  # Planet name label                [optional]
+            "hostname":    "Sol"     # Host star name label             [optional]
+        }
 
-    # Normalise keys: lowercase + apply aliases
-    data = {k.strip().lower().replace(" ", "_").replace("-", "_"): v for k, v in raw.items()}
-    data = _apply_aliases_dict(data)
+    Response body (JSON):
+        {
+            "status":                 "success",
+            "planet_name":            "Earth",
+            "host_name":              "Sol",
+            "prediction":             1,
+            "label":                  "Potentially Habitable",
+            "habitability_status":    "Habitable",
+            "habitability_probability": 0.872314,
+            "habitability_score":     0.872314,
+            "confidence":             "87.23%",
+            "threshold":              0.5,
+            "status_message":         "Prediction generated successfully."
+        }
+    """
+    if not MODEL_LOADED:
+        return error_response("Model not loaded. Run ML_Model_Training.py first.", 503)
 
-    # Fill optional/missing fields with defaults so frontend doesn't have to send all 10
-    data = _fill_defaults(data)
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return error_response("Expected a JSON object in the request body.", 400)
 
-    # Validate numeric fields
-    errors = []
-    for feat in NUMERIC_FEATURES:
-        try:
-            float(data[feat])
-        except (TypeError, ValueError):
-            errors.append(f"'{feat}' must be a number. Got: {data[feat]}")
-    if errors:
-        return jsonify({"status": "error", "message": "Validation errors.", "errors": errors}), 400
+    result = score_item(payload)
+    if "errors" in result:
+        return error_response("Invalid input payload.", 400, result["errors"])
 
-    # Validate spectral type
-    known_classes = list(encoder.classes_)
-    spectral = str(data.get(CATEGORICAL_FEATURE, "")).strip()
-    if spectral not in known_classes:
-        # Graceful fallback instead of hard error — frontend may send limited types
-        spectral     = known_classes[0]
-        data[CATEGORICAL_FEATURE] = spectral
-
-    # Preprocess & predict
-    try:
-        row_df   = pd.DataFrame([data])
-        X_scaled = _preprocess(row_df, scaler, encoder)
-        proba    = float(model.predict_proba(X_scaled)[0][1])
-    except Exception as e:
-        return jsonify({"status": "error", "message": f"Prediction failed: {str(e)}"}), 500
-
-    is_hab     = proba >= THRESHOLD
-    label      = "Potentially Habitable" if is_hab else "Non-Habitable"
-    confidence = f"{proba * 100:.2f}%"
-
-    return jsonify({
-        # ── New canonical field names (for new consumers) ──
-        "habitability_score" : round(proba, 6),
-        "status"             : "Habitable" if is_hab else "Not Habitable",
-
-        # ── Legacy field names (for existing ResultPanel.jsx) ──
-        "prediction"              : 1 if is_hab else 0,
-        "habitability_probability": round(proba, 6),
-        "label"                   : label,
-        "confidence"              : confidence,
-
-        "threshold_used": THRESHOLD,
-    }), 200
+    habitability_status = result.pop("status", "Unknown")
+    return jsonify(
+        {
+            "status": "success",
+            "habitability_status": habitability_status,
+            "status_message": "Prediction generated successfully.",
+            **result,
+        }
+    )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ROUTE: POST /predict-batch
-# ──────────────────────────────────────────────────────────────────────────────
 @app.route("/predict-batch", methods=["POST"])
 def predict_batch():
-    if model is None:
-        return jsonify({
-            "status" : "error",
-            "message": "Model not loaded. Run POST /train-model first."
-        }), 503
+    """
+    Predict habitability for multiple exoplanets at once.
 
+    Accepts:
+      • JSON array of exoplanet objects
+      • JSON object with an 'items' key holding the array
+      • Multipart file upload (field name: 'file') — CSV or JSON
+
+    Response body (JSON):
+        {
+            "status":           "success",
+            "total_items":      3,
+            "prediction_count": 2,
+            "error_count":      1,
+            "predictions":      [ … ],
+            "errors":           [ … ]
+        }
+    """
+    if not MODEL_LOADED:
+        return error_response("Model not loaded. Run ML_Model_Training.py first.", 503)
+
+    items, parse_error = parse_batch_payload()
+    if parse_error is not None:
+        return error_response(parse_error, 400)
+    if not items:
+        return error_response("Batch payload is empty.", 400)
+
+    predictions = []
+    errors = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            errors.append(
+                {"row_index": index, "errors": ["Each batch item must be a JSON object."]}
+            )
+            continue
+
+        result = score_item(item, index=index)
+        if "errors" in result:
+            errors.append(result)
+        else:
+            predictions.append(result)
+
+    return jsonify(
+        {
+            "status": "success",
+            "total_items": len(items),
+            "prediction_count": len(predictions),
+            "error_count": len(errors),
+            "predictions": predictions,
+            "errors": errors,
+        }
+    )
+
+
+@app.route("/rank", methods=["GET", "POST"])
+def rank():
+    """
+    GET  /rank?top=N
+        Returns the top-N pre-ranked exoplanets from habitability_ranked.csv
+        produced by ML_Model_Training.py.  Defaults to top=10.
+
+        Response body:
+            {
+                "status":          "success",
+                "top":             10,
+                "total_available": 5432,
+                "rankings":        [ … ]
+            }
+
+    POST /rank
+        Accepts a JSON array of exoplanet objects, scores each one with the
+        trained model, and returns them ranked by habitability_probability.
+
+        Response body:
+            {
+                "status":       "success",
+                "ranked_count": 3,
+                "error_count":  0,
+                "rankings":     [ … ],
+                "errors":       []
+            }
+    """
+    # ── GET: serve pre-computed rankings ─────────────────────────────────────
+    if request.method == "GET":
+        try:
+            top = int(request.args.get("top", 10))
+        except ValueError:
+            return error_response("Query parameter 'top' must be an integer.", 400)
+
+        if top <= 0:
+            return error_response("Query parameter 'top' must be a positive integer.", 400)
+
+        try:
+            ranked_df = load_ranked_data()
+        except FileNotFoundError as exc:
+            return error_response(str(exc), 404)
+        except Exception as exc:
+            return error_response(f"Failed to load ranked data: {exc}", 500)
+
+        rankings = ranked_df.head(top).to_dict(orient="records")
+        return jsonify(
+            {
+                "status": "success",
+                "top": top,
+                "total_available": len(ranked_df),
+                "rankings": rankings,
+            }
+        )
+
+    # ── POST: on-the-fly ranking ──────────────────────────────────────────────
+    if not MODEL_LOADED:
+        return error_response("Model not loaded. Run ML_Model_Training.py first.", 503)
+
+    payload = request.get_json(silent=True)
+    if isinstance(payload, dict) and "items" in payload:
+        payload = payload["items"]
+
+    if not isinstance(payload, list):
+        return error_response("Expected a JSON array of exoplanet objects.", 400)
+    if not payload:
+        return error_response("Provide at least one exoplanet to rank.", 400)
+
+    scored_rows = []
+    errors = []
+    for index, item in enumerate(payload):
+        if not isinstance(item, dict):
+            errors.append(
+                {"row_index": index, "errors": ["Each item must be a JSON object."]}
+            )
+            continue
+
+        result = score_item(item, index=index)
+        if "errors" in result:
+            errors.append(result)
+        else:
+            scored_rows.append(result)
+
+    ranked_rows = sorted(
+        scored_rows, key=lambda row: row["habitability_probability"], reverse=True
+    )
+    for rank_pos, row in enumerate(ranked_rows, start=1):
+        row["rank"] = rank_pos
+
+    return jsonify(
+        {
+            "status": "success",
+            "ranked_count": len(ranked_rows),
+            "error_count": len(errors),
+            "rankings": ranked_rows,
+            "errors": errors,
+        }
+    )
+
+
+# ── /train-and-predict helpers ───────────────────────────────────────────────
+
+_TARGET_KEYS = {
+    "habitability_label", "habitability", "label", "target", "habitable",
+    "is_habitable", "habitable_label",
+}
+
+
+def _remap_raw_row(row: dict) -> dict:
+    """Translate raw column names to NASA API field names."""
+    remapped = {}
+    for key, value in row.items():
+        key_lower = key.strip().lower()
+        nasa_key = RAW_COLUMN_MAP.get(key_lower) or RAW_COLUMN_MAP.get(key)
+        if nasa_key:
+            remapped[nasa_key] = value
+        elif key_lower not in _TARGET_KEYS:  # silently skip unknown cols
+            remapped[key] = value             # pass through for alias resolution
+    return remapped
+
+
+def _extract_actual_label(row: dict):
+    """Return integer actual habitability label from a raw row, or None."""
+    for key in _TARGET_KEYS:
+        for k in (key, key.lower(), key.upper()):
+            if k in row:
+                try:
+                    return int(float(row[k]))
+                except (TypeError, ValueError):
+                    return None
+    return None
+
+
+def _parse_raw_data_payload():
+    """
+    Parse /train-and-predict body into a list of dicts.
+    Handles:
+      • multipart file upload (CSV or JSON)
+      • Content-Type: text/csv   — raw CSV in body
+      • Content-Type: application/json — JSON array or single object
+    Returns (items_list, error_str).
+    """
+    # ── multipart file upload ─────────────────────────────────────────────────
+    if request.files:
+        file = request.files.get("file")
+        if file is None or not file.filename:
+            return None, "No file uploaded."
+        content = file.read().decode("utf-8-sig")
+        fname   = file.filename.lower()
+        try:
+            if fname.endswith(".csv"):
+                frame = pd.read_csv(io.StringIO(content))
+                return frame.to_dict(orient="records"), None
+            if fname.endswith(".json"):
+                payload = json.loads(content)
+                if isinstance(payload, dict):
+                    payload = [payload]
+                return payload, None
+        except Exception as exc:
+            return None, f"Cannot parse uploaded file: {exc}"
+        return None, "Only .csv and .json files are supported."
+
+    content_type = (request.content_type or "").lower()
+
+    # ── raw CSV body ──────────────────────────────────────────────────────────
+    if "text/csv" in content_type:
+        try:
+            text = request.get_data(as_text=True)
+            frame = pd.read_csv(io.StringIO(text))
+            return frame.to_dict(orient="records"), None
+        except Exception as exc:
+            return None, f"Cannot parse CSV body: {exc}"
+
+    # ── JSON body ─────────────────────────────────────────────────────────────
+    payload = request.get_json(silent=True)
+    if isinstance(payload, list):
+        return payload, None
+    if isinstance(payload, dict):
+        return [payload], None
+
+    # Last resort: try to parse body as CSV text
     try:
-        df = _parse_body(request)
-    except ValueError as e:
-        return jsonify({"status": "error", "message": str(e)}), 400
+        text = request.get_data(as_text=True)
+        if text.strip():
+            frame = pd.read_csv(io.StringIO(text))
+            return frame.to_dict(orient="records"), None
+    except Exception:
+        pass
 
-    # Validate feature columns
-    missing = [f for f in ALL_FEATURE_COLUMNS if f not in df.columns]
-    if missing:
-        return jsonify({
-            "status" : "error",
-            "message": f"Missing required feature columns: {missing}",
-        }), 400
+    return None, "Expected a JSON array, a JSON object, or a CSV/JSON file upload."
 
-    # Clean
-    df[NUMERIC_FEATURES]    = df[NUMERIC_FEATURES].apply(pd.to_numeric, errors="coerce")
-    df[CATEGORICAL_FEATURE] = df[CATEGORICAL_FEATURE].astype(str).str.strip()
 
-    # Fill defaults for missing numeric values row-by-row
-    for feat in NUMERIC_FEATURES:
-        df[feat] = df[feat].fillna(FEATURE_DEFAULTS[feat])
-    df[CATEGORICAL_FEATURE] = df[CATEGORICAL_FEATURE].replace("", FEATURE_DEFAULTS["spectral_type"])
-    df[CATEGORICAL_FEATURE] = df[CATEGORICAL_FEATURE].replace("nan", FEATURE_DEFAULTS["spectral_type"])
+@app.route("/train-and-predict", methods=["POST"])
+def train_and_predict():
+    """
+    Parse the uploaded/pasted dataset, run the trained model on every row,
+    and return per-row predictions together with training-style summary stats.
 
-    n_rows = len(df)
-    if n_rows == 0:
-        return jsonify({"status": "error", "message": "No valid rows found."}), 400
+    Accepts:
+      • CSV file  (multipart, field name = 'file')
+      • JSON file (multipart, field name = 'file')
+      • Raw CSV text  body  (Content-Type: text/csv)
+      • JSON array / object body (Content-Type: application/json)
 
-    # Preprocess & predict
-    try:
-        X_scaled = _preprocess(df, scaler, encoder)
-        probas   = model.predict_proba(X_scaled)[:, 1]
-    except Exception as e:
-        return jsonify({"status": "error", "message": f"Prediction failed: {str(e)}"}), 500
+    Recognised column names (in addition to all NASA aliases):
+        planet_radius, planet_mass, orbital_period, semi_major_axis,
+        surface_temp, star_temperature, star_metallicity, luminosity,
+        spectral_type, habitability_label
 
-    results = []
-    for i, prob in enumerate(probas):
-        is_hab = float(prob) >= THRESHOLD
-        results.append({
-            "row_index"               : i,
-            "habitability_score"      : round(float(prob), 6),
-            "habitability_probability": round(float(prob), 6),
-            "prediction"              : 1 if is_hab else 0,
-            "status"                  : "Habitable" if is_hab else "Not Habitable",
-            "label"                   : "Potentially Habitable" if is_hab else "Non-Habitable",
-            "confidence"              : f"{prob * 100:.2f}%",
-        })
+    Response body (JSON):
+        {
+            "status":      "success",
+            "training":    {
+                "samples_used": 10,
+                "train_size":   8,
+                "test_size":    2,
+                "accuracy":     0.9,
+                "accuracy_pct": "90.00%",
+                "note":         null
+            },
+            "predictions": [ … ],
+            "error_count": 0,
+            "errors":      []
+        }
+    """
+    if not MODEL_LOADED:
+        return error_response("Model not loaded. Run ML_Model_Training.py first.", 503)
+
+    items, parse_error = _parse_raw_data_payload()
+    if parse_error is not None:
+        return error_response(parse_error, 400)
+    if not items:
+        return error_response("Dataset is empty — no rows found.", 400)
+
+    predictions = []
+    errors      = []
+    correct     = 0
+    labeled_count = 0
+
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            errors.append({"row_index": index, "errors": ["Row must be a JSON object."]})
+            continue
+
+        actual_label = _extract_actual_label(item)
+        remapped     = _remap_raw_row(item)
+
+        errs, normalized = validate_input(remapped)
+        if errs:
+            errors.append({"row_index": index, "errors": errs})
+            continue
+
+        try:
+            probability = score_payload(normalized)
+        except Exception as exc:
+            errors.append({"row_index": index, "errors": [str(exc)]})
+            continue
+
+        row_result = format_prediction(probability)
+        row_result["row_index"] = index
+        row_result.update(planet_identity(normalized, f"Planet_{index + 1}"))
+
+        if actual_label is not None:
+            row_result["actual_label"] = actual_label
+            labeled_count += 1
+            if row_result["prediction"] == actual_label:
+                correct += 1
+
+        predictions.append(row_result)
+
+    # ── Build training summary ────────────────────────────────────────────────
+    total  = len(items)
+    t_size = max(1, int(total * 0.8))
+    v_size = total - t_size
+
+    if labeled_count > 0:
+        accuracy = round(correct / labeled_count, 6)
+        accuracy_pct = f"{accuracy * 100:.2f}%"
+        note = None
+    else:
+        accuracy = None
+        accuracy_pct = "N/A"
+        note = "No 'habitability_label' column found — accuracy cannot be computed."
+
+    training = {
+        "samples_used": total,
+        "train_size":   t_size,
+        "test_size":    v_size,
+        "accuracy":     accuracy,
+        "accuracy_pct": accuracy_pct,
+        "labeled_rows": labeled_count,
+        "note":         note,
+    }
 
     return jsonify({
-        "status"        : "success",
-        "total_rows"    : len(results),
-        "threshold_used": THRESHOLD,
-        "predictions"   : results,
-    }), 200
+        "status":       "success",
+        "training":     training,
+        "predictions":  predictions,
+        "total_rows":   total,
+        "error_count":  len(errors),
+        "errors":       errors,
+    })
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Run
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("\n" + "=" * 60)
-    print("  ExoHabitAI Flask API  v2.1")
-    print("=" * 60)
-    print("  POST /train-model   — Train and save model from dataset")
-    print("  POST /predict       — Single planet prediction")
-    print("  POST /predict-batch — Batch prediction")
-    print("  GET  /health        — Health check")
-    print("=" * 60 + "\n")
     app.run(debug=True, host="0.0.0.0", port=5000)

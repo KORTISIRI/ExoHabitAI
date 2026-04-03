@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+*.log
+
+# Data & Models (Heavy or unnecessary)
+original-dataset.crdownload
+preprocessed-data-final.csv
+preprocessed-data.csv
+preprocessed.csv
+# PS_2026.02.09_06.11.21.csv # Kept because of script hardcoding as discussed
+missing_value_heatmap.png
+training_output.txt
+files_list.txt
+all_files_clean.txt
+out.txt
+predictions_clean.json
+processed_features_out.json
+
+# Local directories
+exo/
+frontend/exohabitai/
+milestone1/
+milestone 2/
+milestone 3/
+plots/
+notebooks/ExoHabitAI_Milestone2.md
+
+# OS
+desktop.ini
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# React
+frontend/updated-frontend/exohabitai/node_modules/
+frontend/updated-frontend/exohabitai/build/
+frontend/updated-frontend/exohabitai/.env.local
+frontend/updated-frontend/exohabitai/.env.development.local
+frontend/updated-frontend/exohabitai/.env.test.local
+frontend/updated-frontend/exohabitai/.env.production.local
