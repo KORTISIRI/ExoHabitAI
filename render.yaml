@@ -1,0 +1,24 @@
+services:
+  # Backend API
+  - type: web
+    name: exohabit-api
+    plan: free
+    runtime: python
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: gunicorn --chdir backend app:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.12
+
+  # Frontend Site
+  - type: static
+    name: exohabit-frontend
+    plan: free
+    buildCommand: cd frontend/updated-frontend/exohabitai && npm install && npm run build
+    staticPublishPath: frontend/updated-frontend/exohabitai/build
+    envVars:
+      - key: REACT_APP_API_URL
+        fromService:
+          name: exohabit-api
+          type: web
+          property: host
