@@ -11,7 +11,7 @@ services:
         value: 3.10.12
 
   # Frontend Site
-  - type: static
+  - type: static_site
     name: exohabit-frontend
     plan: free
     buildCommand: cd frontend/updated-frontend/exohabitai && npm install && npm run build
