@@ -11,9 +11,10 @@ services:
         value: 3.10.12
 
   # Frontend Site
-  - type: static_site
+  - type: web
     name: exohabit-frontend
     plan: free
+    runtime: static
     buildCommand: cd frontend/updated-frontend/exohabitai && npm install && npm run build
     staticPublishPath: frontend/updated-frontend/exohabitai/build
     envVars:
