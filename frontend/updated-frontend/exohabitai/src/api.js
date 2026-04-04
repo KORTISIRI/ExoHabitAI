@@ -3,7 +3,7 @@
  * All backend interactions go through this module.
  */
 
-const BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+const BASE_URL = 'https://exohabitai-1-3xkv.onrender.com';
 
 // ── Custom error class ────────────────────────────────────────────────────────
 export class ApiError extends Error {
